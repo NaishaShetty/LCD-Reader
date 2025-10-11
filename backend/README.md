@@ -17,7 +17,7 @@ The backend provides APIs and background processing logic to:
 
   ## 🧩 Tech Stack
 
-  | Technology                     | Purpose                                    |
+| Technology                     | Purpose                                    |
 | ------------------------------ | ------------------------------------------ |
 | **FastAPI**                    | High-speed backend framework for REST APIs |
 | **Uvicorn**                    | ASGI server to host the FastAPI app        |
@@ -29,6 +29,7 @@ The backend provides APIs and background processing logic to:
 | **SQLite (via `database.py`)** | Local database to store test results       |
 | **PyYAML**                     | Model configuration parsing                |
 | **Python-Multipart**           | File upload handling in FastAPI            |
+
 
 
 
