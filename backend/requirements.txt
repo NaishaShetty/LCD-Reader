@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+opencv-python
+numpy
+pandas
+matplotlib
+ffmpeg-python
+ultralytics
+PyYAML
