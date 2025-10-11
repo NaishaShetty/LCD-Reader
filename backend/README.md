@@ -1,20 +1,39 @@
 ## ⚙️ Propellor Testing System — Backend (FastAPI + YOLO + OCR)
 
-This backend powers the Propellor Testing System, a video-based OCR pipeline built using FastAPI, YOLOv8, and OpenCV.
-It extracts LCD readings (Current, Thrust, RPM) from uploaded videos, generates analytical reports (CSV + Graphs), and saves test data in a local SQLite database.
+A high-performance FastAPI backend for the Propellor Testing System, designed to process video inputs, extract LCD readings using YOLOv8 OCR, and generate analytical performance reports.
+It powers the React frontend by handling video uploads, background frame processing, and database management for test sessions.
 
-## Core Backend Technologies
+## Overview
+
+The backend provides APIs and background processing logic to:
+
+- Accept video uploads (Current, Thrust, and RPM tests).
+- Extract frames at user-selected FPS (1–10 FPS).
+- Use YOLOv8 to recognize LCD digits in frames.
+- Generate time-series CSVs and analytical graphs.
+- Calculate performance metrics such as Power and Efficiency.
+- Store and retrieve test sessions from a local SQLite database.
+- Expose all results and history via REST API endpoints.
+
+
+## Core Framework
 
 - FastAPI
 - Uvicorn
-- OpenCV
-- NumPy
-- Pandas
-- Matplotlib
-- FFmpeg-Python
-- Ultralytics (YOLOv8)
-- PyYAML
-- Python-Multipart
+
+## Computer Vision & Processing 
+
+- opencv-python
+- ffmpeg-python
+- ultralytics
+- numpy
+- pandas
+- matplotlib
+
+  ## Configuration & Upload Handling
+
+  - PyYAML
+-  python-multipart
 
 
 ## Backend Setup
