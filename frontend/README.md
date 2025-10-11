@@ -42,11 +42,17 @@ react-scripts
 
  ## UI & Styling
 
-@mui/material
-@mui/icons-material
-@emotion/react
-@emotion/styled
-@fontsource/inter
+- @mui/material
+- @mui/icons-material
+- @emotion/react
+- @emotion/styled
+- @fontsource/inter
+
+## Utilities
+
+- axios
+- chart.js
+- react-chartjs-2
 
 
 # Getting Started with React App
