@@ -40,7 +40,7 @@ react-scripts
 
 ```
 
- ###UI & Styling
+ ## UI & Styling
 
 @mui/material
 @mui/icons-material
