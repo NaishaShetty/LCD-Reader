@@ -14,6 +14,9 @@ import yaml
 from collections import deque, Counter
 from database import save_test_result
 
+# -------------------- CONFIG -------------------- #
+DEBUG_MODE = True  # set to False to silence per-frame debug prints
+
 # -------------------- PATHS & MODEL -------------------- #
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -24,6 +27,7 @@ YAML_PATH = os.path.join(BASE_DIR, "data.yaml")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
+# Load model and class names
 MODEL = YOLO(MODEL_PATH)
 with open(YAML_PATH, "r") as f:
     DATA_CFG = yaml.safe_load(f)
@@ -84,17 +88,19 @@ def _ffmpeg_extract(video_path: str, out_dir: str, fps: int) -> None:
 def _opencv_fallback_extract(video_path: str, out_dir: str, fps: int) -> None:
     cap = cv2.VideoCapture(video_path)
     real_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # Use float interval for better handling of high fps videos
     frame_interval = max(1.0, real_fps / float(max(1, fps)))
-    frame_idx = 0
+    frame_idx = 0.0
     saved = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        # sample when frame_idx modulo frame_interval is near zero
         if int(round(frame_idx % frame_interval)) == 0:
             cv2.imwrite(os.path.join(out_dir, f"frame_{saved:06d}.jpg"), frame)
             saved += 1
-        frame_idx += 1
+        frame_idx += 1.0
     cap.release()
 
 def extract_frames_custom(task_id: str, video_path: str, fps: int) -> List[str]:
@@ -107,14 +113,25 @@ def extract_frames_custom(task_id: str, video_path: str, fps: int) -> List[str]:
         TASK_PROGRESS[task_id].update({"message": f"FFmpeg failed, fallback OpenCV. ({e})"})
         _opencv_fallback_extract(video_path, frames_dir, fps=fps)
 
-    frame_files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")])
+    frame_files = sorted([
+        os.path.join(frames_dir, f)
+        for f in os.listdir(frames_dir)
+        if f.lower().endswith(".jpg")
+    ])
 
-    # If too few frames, run fallback to ensure coverage
+    # If too few frames, run fallback to ensure coverage (sometimes ffmpeg fails on exotic codecs)
     if len(frame_files) < 5:
+        if DEBUG_MODE:
+            print(f"[DEBUG] extract_frames_custom: only {len(frame_files)} frames; retrying with OpenCV fallback")
         _opencv_fallback_extract(video_path, frames_dir, fps=fps)
-        frame_files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")])
+        frame_files = sorted([
+            os.path.join(frames_dir, f)
+            for f in os.listdir(frames_dir)
+            if f.lower().endswith(".jpg")
+        ])
 
-    print(f"[DEBUG] extract_frames_custom: extracted {len(frame_files)} frames for task {task_id} at {fps} fps")
+    if DEBUG_MODE:
+        print(f"[DEBUG] extract_frames_custom: extracted {len(frame_files)} frames for task {task_id} at {fps} fps")
     return frame_files
 
 # -------------------- PREPROCESSING -------------------- #
@@ -122,10 +139,12 @@ def preprocess_frame(img: Optional[np.ndarray], invert: bool = False) -> Optiona
     if img is None:
         return None
     h, w = img.shape[:2]
+    # rotate if portrait
     if h > w * 1.15:
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if invert:
+        # invert so that dark digits on light background become bright on dark background
         gray = cv2.bitwise_not(gray)
     den = cv2.bilateralFilter(gray, 9, 75, 75)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -140,33 +159,54 @@ def preprocess_frame(img: Optional[np.ndarray], invert: bool = False) -> Optiona
 
 # -------------------- OCR -------------------- #
 def _predict_reading(img: np.ndarray, conf: float) -> Tuple[str, float]:
+    """
+    Runs the YOLO model and returns the assembled reading string and average confidence.
+    Also does some cleaning (remove nonsense trailing dots).
+    """
     results = MODEL.predict(img, conf=conf, verbose=False)[0]
     boxes: List[Tuple[float, str, float]] = []
     for b in results.boxes:
         cls = int(b.cls[0].item())
         xc = float(b.xywh[0][0].item())
-        ch = CLASS_NAMES[cls]
+        ch = CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else ""
         score = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
         boxes.append((xc, ch, score))
+
     if not boxes:
         return "", 0.0
+
     boxes.sort(key=lambda x: x[0])
+    # keep only allowed symbols
     reading = "".join([ch for _, ch, _ in boxes if ch in "0123456789.-"])
     confs = [s for _, _, s in boxes if s is not None]
     avg_conf = float(np.mean(confs)) if confs else 0.0
+
+    # fix multiple dots (keep first dot) and remove isolated trailing dots
     if reading.count(".") > 1:
-        i = reading.find(".")
-        reading = reading[:i + 1] + reading[i + 1:].replace(".", "")
-    reading = reading.strip()
+        first_dot = reading.find(".")
+        reading = reading[:first_dot + 1] + reading[first_dot + 1:].replace(".", "")
+    if reading.endswith("."):
+        reading = reading.rstrip(".")
+    # trims but preserve single leading '-'
+    if reading in ["-", "--", ""]:
+        reading = reading.strip()
+    else:
+        reading = reading.strip()
+
     return reading, avg_conf
 
 def read_lcd_from_frame(frame: np.ndarray, conf: float = 0.25) -> Tuple[Optional[float], str, float]:
+    """
+    Dual-pass (normal + inverted) reading. Chooses the reading with higher avg confidence.
+    Returns (numeric_value_or_None, raw_display_string, confidence)
+    """
     processed_normal = preprocess_frame(frame, invert=False)
     processed_inverted = preprocess_frame(frame, invert=True)
 
     reading_n, conf_n = _predict_reading(processed_normal, conf)
     reading_i, conf_i = _predict_reading(processed_inverted, conf)
 
+    # Prefer the inverted reading if more confident (useful when digits are light/dark)
     if conf_i > conf_n:
         reading = reading_i
         confidence = conf_i
@@ -174,15 +214,18 @@ def read_lcd_from_frame(frame: np.ndarray, conf: float = 0.25) -> Tuple[Optional
         reading = reading_n
         confidence = conf_n
 
+    # small boost in low-confidence but digit-present cases (helps when model under-confident)
     if confidence < 0.2 and any(ch.isdigit() for ch in reading):
         confidence = 0.25
 
+    # sanitize multiple leading hyphens
     if reading.startswith("--"):
         reading = "-" + reading.lstrip("-")
     if reading.endswith("-"):
         reading = reading[:-1]
 
     reading = reading.strip()
+
     try:
         val = float(reading) if reading not in ["", "-", "."] else None
     except Exception:
@@ -190,7 +233,7 @@ def read_lcd_from_frame(frame: np.ndarray, conf: float = 0.25) -> Tuple[Optional
 
     return val, reading, confidence
 
-# -------------------- MERGING -------------------- #
+# -------------------- MERGING (MULTI-SERIES) -------------------- #
 def _safe_merge_series(cur: Optional[pd.DataFrame], thr: Optional[pd.DataFrame], rpm: Optional[pd.DataFrame]) -> pd.DataFrame:
     """
     Merge three series into a single DataFrame with aligned time_s.
@@ -207,22 +250,28 @@ def _safe_merge_series(cur: Optional[pd.DataFrame], thr: Optional[pd.DataFrame],
     merged = pd.DataFrame({"time_s": sorted(times)})
 
     if cur is not None and not cur.empty:
-        merged = merged.merge(cur[["time_s", "current_a", "current_display"]] if "current_display" in cur.columns else cur[["time_s", "current_a"]],
-                              on="time_s", how="left")
+        if "current_display" in cur.columns:
+            merged = merged.merge(cur[["time_s", "current_a", "current_display"]], on="time_s", how="left")
+        else:
+            merged = merged.merge(cur[["time_s", "current_a"]], on="time_s", how="left")
     else:
         merged["current_a"] = np.nan
         merged["current_display"] = np.nan
 
     if thr is not None and not thr.empty:
-        merged = merged.merge(thr[["time_s", "thrust_g", "thrust_display"]] if "thrust_display" in thr.columns else thr[["time_s", "thrust_g"]],
-                              on="time_s", how="left")
+        if "thrust_display" in thr.columns:
+            merged = merged.merge(thr[["time_s", "thrust_g", "thrust_display"]], on="time_s", how="left")
+        else:
+            merged = merged.merge(thr[["time_s", "thrust_g"]], on="time_s", how="left")
     else:
         merged["thrust_g"] = np.nan
         merged["thrust_display"] = np.nan
 
     if rpm is not None and not rpm.empty:
-        merged = merged.merge(rpm[["time_s", "rpm", "rpm_display"]] if "rpm_display" in rpm.columns else rpm[["time_s", "rpm"]],
-                              on="time_s", how="left")
+        if "rpm_display" in rpm.columns:
+            merged = merged.merge(rpm[["time_s", "rpm", "rpm_display"]], on="time_s", how="left")
+        else:
+            merged = merged.merge(rpm[["time_s", "rpm"]], on="time_s", how="left")
     else:
         merged["rpm"] = np.nan
         merged["rpm_display"] = np.nan
@@ -237,6 +286,7 @@ def _safe_merge_series(cur: Optional[pd.DataFrame], thr: Optional[pd.DataFrame],
 def _align_time(df: Optional[pd.DataFrame], fps: int = 5) -> Optional[pd.DataFrame]:
     if df is None or df.empty or "time_s" not in df.columns:
         return df
+    # round times to 2 decimal places for alignment
     df["time_s"] = df["time_s"].round(2)
     return df
 
@@ -272,19 +322,16 @@ def build_session_report(session_id: str) -> Dict:
         if display_col in merged_df.columns and merged_df[display_col].notna().any():
             return merged_df[display_col].fillna(default).tolist()
         else:
-            # format numeric values to preserve two decimals if they have decimals, preserve leading zeros by formatting with 2 decimals
             if numeric_col in merged_df.columns:
                 out = []
                 for v in merged_df[numeric_col].tolist():
                     if v is None or (isinstance(v, float) and np.isnan(v)):
                         out.append(default)
                     else:
-                        # if number is integer-like, show as integer string without decimals when original had none
-                        # but since we don't know original format, keep two decimals for decimals
                         if isinstance(v, float) and (abs(v - round(v)) > 1e-9):
+                            # preserve two decimals for floats with decimals
                             out.append(f"{v:.2f}")
                         else:
-                            # integer-like
                             out.append(str(int(round(v))))
                 return out
             else:
@@ -384,18 +431,15 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
                 most_common, count = counter.most_common(1)[0]
                 if count >= 2:
                     chosen_raw = most_common
-
             if chosen_raw is None:
                 chosen_raw = raw
 
-            # --- NEW: minus-preservation heuristics ---
+            # --- MINUS PRESERVATION HEURISTICS ---
             # 1) If majority of recent non_empty readings have leading '-', force leading '-'
             if non_empty:
                 neg_count = sum(1 for r in non_empty if isinstance(r, str) and r.startswith("-"))
                 if neg_count >= max(1, (len(non_empty) // 2)):  # majority (or at least 1 when short)
                     if not (isinstance(chosen_raw, str) and chosen_raw.startswith("-")):
-                        # prepend '-' but keep digits intact
-                        # remove any stray leading '-' first
                         s = "" if chosen_raw in [None] else str(chosen_raw)
                         chosen_raw = "-" + s.lstrip("-")
 
@@ -409,6 +453,7 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
             # set prev_raw_global for next iteration
             prev_raw_global = chosen_raw if isinstance(chosen_raw, str) and chosen_raw != "" else prev_raw_global
 
+            # validate and coerce numeric value
             try:
                 chosen_val = float(chosen_raw) if chosen_raw not in ["", "-", "."] else None
             except Exception:
@@ -416,7 +461,9 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
 
             t = i * (1.0 / fps)
 
-            # store both numeric and raw display columns
+            if DEBUG_MODE:
+                print(f"[DEBUG] Frame {i+1}/{n} | Raw: '{raw}' | Chosen: '{chosen_raw}' | Conf: {confidence:.2f} | Val: {chosen_val}")
+
             if video_type == "current":
                 rows.append({"time_s": round(t, 4), "current_a": chosen_val, "current_display": chosen_raw})
             elif video_type == "thrust":
@@ -431,19 +478,19 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
         # Ensure consistent columns and smoothing for numeric columns
         if not df.empty:
             if "current_a" in df.columns:
-                df["current_a"] = df["current_a"].astype(float, errors="ignore")
+                df["current_a"] = pd.to_numeric(df["current_a"], errors="coerce")
                 df["current_a"] = df["current_a"].rolling(window=3, min_periods=1, center=True).median()
             if "thrust_g" in df.columns:
-                df["thrust_g"] = df["thrust_g"].astype(float, errors="ignore")
+                df["thrust_g"] = pd.to_numeric(df["thrust_g"], errors="coerce")
                 df["thrust_g"] = df["thrust_g"].rolling(window=3, min_periods=1, center=True).median()
             if "rpm" in df.columns:
-                df["rpm"] = df["rpm"].astype(float, errors="ignore")
+                df["rpm"] = pd.to_numeric(df["rpm"], errors="coerce")
                 df["rpm"] = df["rpm"].rolling(window=3, min_periods=1, center=True).median()
 
         series_csv = os.path.join(RESULT_DIR, f"{task_id}_{video_type}.csv")
         df.to_csv(series_csv, index=False)
 
-        # Attach series to session (keep as-is: may have time_s and other columns)
+        # Attach series to session
         SESSIONS[session_id]["series"][video_type] = df
 
         TASK_PROGRESS[task_id].update({"phase": "merging", "message": "Merging & plotting...", "progress": 95})
