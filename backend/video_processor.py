@@ -365,6 +365,7 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
         TASK_PROGRESS[task_id].update({"phase": "reading", "message": "Reading frames..."})
         rows: List[Dict] = []
         recent_readings = deque(maxlen=7)
+        prev_raw_global = None  # track previous (global) raw for extra minus heuristics
 
         for i, fp in enumerate(frames):
             img = cv2.imread(fp)
@@ -383,8 +384,30 @@ def process_video_task(task_id: str, session_id: str, video_type: str, video_pat
                 most_common, count = counter.most_common(1)[0]
                 if count >= 2:
                     chosen_raw = most_common
+
             if chosen_raw is None:
                 chosen_raw = raw
+
+            # --- NEW: minus-preservation heuristics ---
+            # 1) If majority of recent non_empty readings have leading '-', force leading '-'
+            if non_empty:
+                neg_count = sum(1 for r in non_empty if isinstance(r, str) and r.startswith("-"))
+                if neg_count >= max(1, (len(non_empty) // 2)):  # majority (or at least 1 when short)
+                    if not (isinstance(chosen_raw, str) and chosen_raw.startswith("-")):
+                        # prepend '-' but keep digits intact
+                        # remove any stray leading '-' first
+                        s = "" if chosen_raw in [None] else str(chosen_raw)
+                        chosen_raw = "-" + s.lstrip("-")
+
+            # 2) If previous global raw had leading '-' and digits match current digits, restore '-'
+            if prev_raw_global and isinstance(prev_raw_global, str) and prev_raw_global.startswith("-") and isinstance(chosen_raw, str) and not chosen_raw.startswith("-"):
+                digits_prev = "".join([c for c in prev_raw_global if c.isdigit() or c == "."])
+                digits_now = "".join([c for c in chosen_raw if c.isdigit() or c == "."])
+                if digits_prev == digits_now and digits_now != "":
+                    chosen_raw = "-" + chosen_raw.lstrip("-")
+
+            # set prev_raw_global for next iteration
+            prev_raw_global = chosen_raw if isinstance(chosen_raw, str) and chosen_raw != "" else prev_raw_global
 
             try:
                 chosen_val = float(chosen_raw) if chosen_raw not in ["", "-", "."] else None
