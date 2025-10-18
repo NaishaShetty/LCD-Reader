@@ -1,5 +1,5 @@
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-import React, { useState, useCallback, useMemo } from "react";
+import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 import {
   AppBar,
@@ -330,6 +330,23 @@ export default function App(): JSX.Element {
     );
   };
 
+  // Auto-resize iframe heights dynamically
+  const iframeRefs = useRef<(HTMLIFrameElement | null)[]>([]);
+
+  useEffect(() => {
+    const handler = (e: MessageEvent) => {
+      if (e.data?.type === "resize" && e.data?.height && e.source) {
+        iframeRefs.current.forEach((iframe) => {
+          if (iframe && iframe.contentWindow === e.source) {
+            iframe.style.height = `${e.data.height}px`;
+          }
+        });
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
   return (
     <ThemeProvider theme={darkTheme}>
       <CssBaseline />
@@ -443,11 +460,21 @@ export default function App(): JSX.Element {
                     </Typography>
                     {graphs.map((g, i) => (
                       <Box key={i} sx={{ mt: 2 }}>
-                        <img
-                          src={g}
-                          alt={`graph-${i}`}
-                          style={{ width: "100%", borderRadius: 8 }}
-                        />
+                        {/* ✅ Interactive + auto-resizing iframe for Plotly graphs */}
+                        <iframe
+                          ref={(el) => (iframeRefs.current[i] = el)}
+                          src={`${g}?t=${Date.now()}`}
+                          title={`Graph ${i}`}
+                          style={{
+                            width: "100%",
+                            height: "500px",
+                            border: "none",
+                            borderRadius: "12px",
+                            boxShadow: "0 0 10px rgba(0, 0, 0, 0.3)",
+                            marginBottom: "1rem",
+                            transition: "height 0.2s ease",
+                          }}
+                        ></iframe>
                       </Box>
                     ))}
                   </>
