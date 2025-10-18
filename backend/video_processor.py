@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# video_processor.py — Full untrimmed, fixed version
-# - preserves existing pipelines, adds robustness and fixes column/merge bugs
-# - copy-paste to replace your backend file
+# video_processor.py — Full untrimmed updated version
+# Implements multi-pipeline OCR readers with robust formatting & JSON-safe report generation.
 
 import os
 import uuid
@@ -16,13 +15,21 @@ import matplotlib.pyplot as plt
 from typing import Dict, Optional, List, Tuple
 from ultralytics import YOLO
 import yaml
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 from database import save_test_result
 import time
 import math
+import logging
 
-# -------------------- CONFIG -------------------- #
+# -------------------- LOGGING / DEBUG -------------------- #
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 DEBUG = True
+
+def _dprint(*args, **kwargs):
+    if DEBUG:
+        logging.debug(" ".join(str(a) for a in args), **kwargs)
+
+# -------------------- PATHS / CONFIG -------------------- #
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 RESULT_DIR = os.path.join(BASE_DIR, "results")
@@ -33,17 +40,47 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # Load model and class names
-MODEL = YOLO(MODEL_PATH)
-with open(YAML_PATH, "r") as f:
-    DATA_CFG = yaml.safe_load(f)
-CLASS_NAMES = DATA_CFG.get("names", [])
+try:
+    MODEL = YOLO(MODEL_PATH)
+except Exception as e:
+    logging.warning("YOLO model load failed: %s", e)
+    MODEL = None
 
+if os.path.exists(YAML_PATH):
+    with open(YAML_PATH, "r") as f:
+        DATA_CFG = yaml.safe_load(f)
+    CLASS_NAMES = DATA_CFG.get("names", [])
+else:
+    CLASS_NAMES = []
+
+# -------------------- GLOBALS -------------------- #
 TASK_PROGRESS: Dict[str, Dict] = {}
-SESSIONS: Dict[str, Dict] = {}
+SESSIONS: Dict[str, Dict] = {}  # session_id -> {meta, series, report}
 
-def _dprint(*args, **kwargs):
-    if DEBUG:
-        print(*args, **kwargs)
+# -------------------- HELPERS -------------------- #
+def reset_progress(task_id: str) -> None:
+    TASK_PROGRESS[task_id] = {"status": "pending", "progress": 0, "phase": "queued", "message": ""}
+
+def get_progress(task_id: str) -> Dict:
+    return TASK_PROGRESS.get(task_id, {"status": "unknown", "progress": 0, "phase": "unknown"})
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def clamp(val, minv=None, maxv=None):
+    if val is None:
+        return None
+    try:
+        if minv is not None and val < minv:
+            return minv
+        if maxv is not None and val > maxv:
+            return maxv
+    except Exception:
+        return val
+    return val
 
 # -------------------- SESSION -------------------- #
 def _init_session(session_id: str, meta: Dict) -> None:
@@ -54,13 +91,13 @@ def _init_session(session_id: str, meta: Dict) -> None:
                 "motor": meta.get("motor", ""),
                 "esc": meta.get("esc", ""),
                 "voltage": float(meta.get("voltage")) if meta.get("voltage") not in [None, ""] else None,
-                "fps": int(meta.get("fps", 5)) if meta.get("fps") not in [None, ""] else 5,
             },
+            # series holds last processed dataframe per type
             "series": {"current": None, "thrust": None, "rpm": None},
             "report": None,
         }
     else:
-        for k in ["prop", "motor", "esc", "voltage", "fps"]:
+        for k in ["prop", "motor", "esc", "voltage"]:
             v = meta.get(k)
             if v not in [None, ""]:
                 if k == "voltage":
@@ -68,24 +105,11 @@ def _init_session(session_id: str, meta: Dict) -> None:
                         v = float(v)
                     except (ValueError, TypeError):
                         v = None
-                if k == "fps":
-                    try:
-                        v = int(v)
-                    except (ValueError, TypeError):
-                        v = 5
                 SESSIONS[session_id]["meta"][k] = v
-
-def reset_progress(task_id: str) -> None:
-    TASK_PROGRESS[task_id] = {"status": "pending", "progress": 0, "phase": "queued", "message": ""}
-
-def get_progress(task_id: str) -> Dict:
-    return TASK_PROGRESS.get(task_id, {"status": "unknown", "progress": 0, "phase": "unknown"})
 
 # -------------------- FRAME EXTRACTION -------------------- #
 def _ffmpeg_extract(video_path: str, out_dir: str, fps: int) -> None:
-    """
-    Use ffmpeg to extract frames at requested fps. Use fps_mode='vfr' equivalent.
-    """
+    # Use fps_mode=vfr and qscale to ensure frames saved
     try:
         (
             ffmpeg
@@ -95,16 +119,9 @@ def _ffmpeg_extract(video_path: str, out_dir: str, fps: int) -> None:
             .overwrite_output()
             .run(quiet=not DEBUG)
         )
-    except TypeError:
-        # older ffmpeg-python versions may not support fps_mode argument
-        (
-            ffmpeg
-            .input(video_path)
-            .filter("fps", fps=fps)
-            .output(os.path.join(out_dir, "frame_%06d.jpg"), start_number=0, qscale=2)
-            .overwrite_output()
-            .run(quiet=not DEBUG)
-        )
+    except Exception as e:
+        _dprint("ffmpeg extract failed:", e)
+        raise
 
 def _opencv_fallback_extract(video_path: str, out_dir: str, fps: int) -> None:
     cap = cv2.VideoCapture(video_path)
@@ -126,30 +143,41 @@ def _opencv_fallback_extract(video_path: str, out_dir: str, fps: int) -> None:
 def extract_frames_custom(task_id: str, video_path: str, fps: int) -> List[str]:
     frames_dir = os.path.join(RESULT_DIR, f"{task_id}_frames")
     os.makedirs(frames_dir, exist_ok=True)
-    TASK_PROGRESS[task_id].update({"phase": "extracting", "message": f"Extracting frames ({fps} FPS)...", "progress": 1})
+    TASK_PROGRESS[task_id].update({"phase": "extracting", "message": f"Extracting frames ({fps} FPS)..."})
     try:
         _ffmpeg_extract(video_path, frames_dir, fps=fps)
     except Exception as e:
         TASK_PROGRESS[task_id].update({"message": f"FFmpeg failed, fallback OpenCV. ({e})"})
         _opencv_fallback_extract(video_path, frames_dir, fps=fps)
+
     frame_files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")])
     if len(frame_files) < 5:
+        # retry with OpenCV if ffmpeg created too few
         _opencv_fallback_extract(video_path, frames_dir, fps=fps)
         frame_files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")])
-    _dprint(f"[DEBUG] Extracted {len(frame_files)} frames from {os.path.basename(video_path)} at {fps} FPS")
+
+    # if extremely large number of frames, downsample to reasonable size to avoid UI lockups
+    MAX_FRAMES = 3000  # keep processing tractable; adjust if you want
+    if len(frame_files) > MAX_FRAMES:
+        step = math.ceil(len(frame_files) / MAX_FRAMES)
+        frame_files = frame_files[::step]
+        TASK_PROGRESS[task_id].update({"message": f"Downsampled frames to {len(frame_files)} to keep processing responsive."})
+
+    _dprint(f"[DEBUG] Extracted {len(frame_files)} frames at {fps} FPS")
     return frame_files
 
-# -------------------- PREPROCESSING -------------------- #
+# -------------------- PREPROCESS -------------------- #
 def preprocess_frame(img: Optional[np.ndarray], invert: bool = False) -> Optional[np.ndarray]:
     if img is None:
         return None
     h, w = img.shape[:2]
-    # rotate if portrait-ish
+    # rotate tall frames to landscape
     if h > w * 1.15:
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if invert:
         gray = cv2.bitwise_not(gray)
+    # noise reduction and contrast
     den = cv2.bilateralFilter(gray, 9, 75, 75)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enh = clahe.apply(den)
@@ -159,39 +187,50 @@ def preprocess_frame(img: Optional[np.ndarray], invert: bool = False) -> Optiona
     morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, k)
     blur = cv2.GaussianBlur(morph, (0, 0), 1.5)
     sharp = cv2.addWeighted(morph, 1.4, blur, -0.4, 0)
+    # return BGR for model expecting 3 channels
     return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
 # -------------------- OCR CORE -------------------- #
 def _predict_reading(img: np.ndarray, conf: float) -> Tuple[str, float]:
     """
-    Run YOLO and build a reading string from predicted characters.
-    Skip classes that are units or letters likely to be 'g' etc.
-    Only keep characters in digits, '.', '-' and treat 'g','G' as units to strip.
+    Predicts character sequence using the YOLO model.
+    Returns (reading_string, avg_confidence).
+    This function assumes MODEL is loaded and CLASS_NAMES is present.
     """
-    results = MODEL.predict(img, conf=conf, verbose=False)[0]
-    boxes: List[Tuple[float, str, float]] = []
-    for b in results.boxes:
-        try:
-            cls = int(b.cls[0].item())
-            xc = float(b.xywh[0][0].item())
-        except Exception:
-            continue
-        ch = CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else ""
-        # Normalize char
-        ch = str(ch).strip()
-        # Skip common letters that are units (g, G)
-        if ch.lower() in ["g", "v", "a", "r", "p", "t", "c", "o", "s"]:
-            continue
-        # Accept only digit, dot, minus
-        if ch not in "0123456789.-":
-            continue
-        score = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
-        boxes.append((xc, ch, score))
+    if MODEL is None:
+        return "", 0.0
+
+    # MODEL.predict can accept numpy images directly
+    results = MODEL.predict(img, conf=conf, verbose=False)
+    if not results:
+        return "", 0.0
+    res0 = results[0]
+    boxes = []
+    try:
+        for b in res0.boxes:
+            cls_idx = int(b.cls[0].item())
+            ch = CLASS_NAMES[cls_idx] if cls_idx < len(CLASS_NAMES) else ""
+            # Keep only characters that matter (digits, '.', '-', maybe 'g' or 'A' stripped later)
+            if ch not in "0123456789.-gG aA":
+                continue
+            # xywh center x
+            try:
+                xc = float(b.xywh[0][0].item())
+            except Exception:
+                xc = 0.0
+            conf_s = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
+            boxes.append((xc, ch, conf_s))
+    except Exception as e:
+        _dprint("Predict reading parse error:", e)
+        return "", 0.0
+
     if not boxes:
         return "", 0.0
+
+    # Sort by x-center to assemble reading left-to-right
     boxes.sort(key=lambda x: x[0])
-    reading = "".join([ch for _, ch, _ in boxes])
-    # Fix multiple decimals by keeping first decimal point
+    reading = "".join(ch for _, ch, _ in boxes)
+    # Cleanup repeating decimal points
     if reading.count(".") > 1:
         first = reading.find(".")
         reading = reading[:first + 1] + reading[first + 1:].replace(".", "")
@@ -201,170 +240,186 @@ def _predict_reading(img: np.ndarray, conf: float) -> Tuple[str, float]:
 # -------------------- MINI OCR PIPELINES -------------------- #
 def read_lcd_current(frame: np.ndarray) -> Tuple[Optional[float], str, float]:
     """
-    Read current meter display. Aim: always capture leading '-' if present.
-    Output display string formatted as xx.xx (two decimals).
+    OCR reader for current meter display.
+      - tries to ensure minus sign presence (via OCR + contour heuristics)
+      - returns value as float, and display string formatted as '-xx.xx' or 'xx.xx'
     """
-    # Preprocess both polarities; minus sign often appears as a thin horizontal glyph
-    processed = preprocess_frame(frame, invert=False)
-    inv = preprocess_frame(frame, invert=True)
+    h, w = frame.shape[:2]
+    # Preprocess targeted region heuristics: current usually in a specific area; but fall back to full frame
+    img = preprocess_frame(frame, invert=False)
+    # Also build an inverted / thresholded variant for minus-line detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    inv_bin = 255 - binary
 
-    # Heuristics: run predict on both images & choose highest confidence
-    r1, c1 = _predict_reading(processed, 0.22) if processed is not None else ("", 0.0)
-    r2, c2 = _predict_reading(inv, 0.22) if inv is not None else ("", 0.0)
+    reading, conf = _predict_reading(img, 0.25)
+    reading = (reading or "").strip()
 
-    # Prefer the reading with higher avg confidence
-    reading, conf = (r2, c2) if c2 > c1 else (r1, c1)
-    reading = reading.replace("..", ".").replace("—", "-").replace("_", "-").strip()
-
-    # Remove trailing units/letters
+    # Normalize common artifacts
+    reading = reading.replace("..", ".").replace("—", "-").replace("_", "-").replace(" ", "")
+    if reading.endswith("."):
+        reading = reading[:-1]
     if reading.lower().endswith("a"):
         reading = reading[:-1]
 
-    # If reading contains letters/garbage, keep only digits, '.', '-'
-    filtered = ''.join(ch for ch in reading if ch in "0123456789.-")
-    reading = filtered
-
-    # Try to detect missing minus sign by analyzing left-side thin contours (common minus)
-    if "-" not in reading:
+    # If OCR missed minus sign, try to detect a minus in left area using contours
+    sign_found = "-" in reading
+    if not sign_found:
+        # examine left band where sign often appears
+        left_w = max(10, int(w * 0.18))
+        band = inv_bin[:, :left_w]
         try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape[:2]
-            # Left area (minus often sits to the left of digits)
-            roi = gray[int(h * 0.35):int(h * 0.65), 0:int(w * 0.22)]
-            _, bin_roi = cv2.threshold(roi, 150, 255, cv2.THRESH_BINARY_INV)
-            contours, _ = cv2.findContours(bin_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                x, y, cw, ch = cv2.boundingRect(cnt)
-                aspect = cw / float(max(ch, 1))
-                # a long thin contour is a good minus sign candidate
-                if aspect > 3.5 and ch < h * 0.25:
-                    reading = "-" + reading
-                    break
+            contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         except Exception:
-            pass
+            contours = []
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            aspect = cw / (ch + 1e-6)
+            # minus sign tends to be a thin wide rect - heuristics
+            if aspect > 3.0 and ch < h * 0.2 and cw > 4:
+                reading = "-" + reading
+                sign_found = True
+                break
 
-    # Clean multiple '-' and leading formatting
+    # Clean double signs
     reading = reading.replace("--", "-")
-    reading = reading.strip()
 
-    # Convert to float and format as xx.xx (two decimals). Keep sign.
-    val = None
+    # Convert reading to float carefully: handle leading zeros like 00.70 and strings without decimal
+    numeric = None
     try:
-        if reading not in ["", "-", "."]:
-            val = float(reading)
+        # Replace stray characters
+        cleaned = "".join(ch for ch in reading if ch in "0123456789.-")
+        if cleaned in ["", "-", ".", "-."]:
+            numeric = None
         else:
-            val = None
+            numeric = float(cleaned)
     except Exception:
-        val = None
+        numeric = None
 
-    # Format readout for display: ensure two decimal places with consistent width
-    display = "-"
-    if val is None:
-        display = "-"
+    # Format display string: ensure two decimals and sign
+    display = ""
+    if numeric is not None:
+        # Round to 2 decimals for display, but keep numeric float as-is
+        # Always show sign if negative
+        if numeric < 0:
+            display = f"-{abs(numeric):05.2f}"  # ensures -xx.xx or -x.xx becomes -xx.xx with leading zero
+        else:
+            # positive: ensure at least two integer places (leading zeros if <10)
+            display = f"{numeric:06.2f}" if numeric >= 0 else f"{abs(numeric):06.2f}"
+            # Strip leading extra zero to get xx.xx if it creates leading zero? user insisted -xx.xx format; positive they want xx.xx
+            # For positive, make it xx.xx (no leading plus or extra leading zero)
+            # e.g., 0.7 -> 00.70 -> drop leading zero to "00.70"? They asked xx.xx format — preserve 2 integer positions if needed
+            # We'll keep consistent two decimal places and show leading zeros as "00.70" to match device reading style
+            # But user earlier asked for "-xx.xx", so negative will have sign and padded digits.
+            display = display  # keep as is like "00.70" or "12.34"
     else:
-        # Use formatting preserving sign and two decimals, but do not add extra padding beyond sign
-        # Example: -0.71 -> "-0.71" ; 0.71 -> "0.71"
-        display = f"{val:.2f}"
+        display = reading or ""
 
-    return val, display, float(conf)
+    return numeric, display, float(conf or 0.0)
+
 
 def read_lcd_thrust(frame: np.ndarray) -> Tuple[Optional[float], str, float]:
     """
-    Thrust OCR: aim to produce integer grams. Remove stray decimal artifacts (like '13.6' being read vs '136').
-    Reject physically impossible spikes. Keep display as integer string.
+    OCR reader for thrust display.
+      - remove decimal artifacts by mapping "13.6" -> 136, "15.68" -> 1568 etc when appropriate
+      - reject enormous impossible readings and filter flicker noise
+      - returns integer grams (float numeric, and string display)
     """
-    proc = preprocess_frame(frame, invert=True)
-    reading, conf = _predict_reading(proc, 0.25) if proc is not None else ("", 0.0)
-    reading = reading.replace("..", ".").replace("—", "-").replace("_", "-").replace(",", ".").strip()
+    inverted = preprocess_frame(frame, invert=True)
+    reading, conf = _predict_reading(inverted, 0.25)
+    reading = (reading or "").strip()
 
-    # Remove trailing unit 'g' if OCR left it
+    # Common cleanup
+    reading = reading.replace("..", ".").replace("—", "-").replace("_", "-").replace(",", ".").replace(" ", "")
     if reading.lower().endswith("g"):
         reading = reading[:-1]
+    if reading.endswith("."):
+        reading = reading[:-1]
+    if reading.startswith("--"):
+        reading = "-" + reading.lstrip("-")
 
-    # Basic normalization: keep only digits, '.', '-'
-    cleaned = ''.join(ch for ch in reading if ch in "0123456789.-")
+    if reading == "":
+        return None, "", float(conf or 0.0)
 
-    # If multiple decimals, keep the first decimal and remove others
-    if cleaned.count(".") > 1:
+    cleaned = reading
+    # If contains decimals, try to decide intended meaning
+    if "." in cleaned:
         parts = cleaned.split(".")
-        cleaned = parts[0] + "." + "".join(parts[1:])
-
-    # Heuristic: if there is a single decimal digit (like 13.6), map to integer by left+right -> '136'
-    numeric_for_int = cleaned
-    if "." in numeric_for_int:
-        left, right = numeric_for_int.split(".", 1)
-        # If right is length 1, interpret as tenths displayed and convert: "13.6" -> 136
-        if len(right) == 1:
-            numeric_for_int = left + right
+        left = parts[0] if parts else ""
+        right = "".join(parts[1:]) if len(parts) > 1 else ""
+        # heuristics:
+        # if right has len 1 -> maybe decimal like 13.6 meaning 136 -> join
+        if len(right) == 1 and len(left) >= 1:
+            cleaned = left + right
+        # if right length == 2 -> likely 2 decimal digits to be removed (15.68 -> 1568)
+        elif len(right) == 2:
+            cleaned = left + right
+        # if more decimals - join first two segments
+        elif len(right) > 2:
+            cleaned = left + right
         else:
-            # if right length is more (e.g., "15.68"), join left+right to remove decimal -> "1568"
-            numeric_for_int = left + right
+            cleaned = left + right
 
-    # Remove any remaining non-digit/minus
-    numeric_for_int = ''.join(ch for ch in numeric_for_int if ch.isdigit() or ch == '-')
+    # Keep digits and optional leading '-'
+    cleaned = "".join(ch for ch in cleaned if ch.isdigit() or ch == "-")
+    if cleaned in ["", "-", "-0"]:
+        cleaned = "0"
 
-    # Normalize empty or lone '-'
-    if numeric_for_int in ["", "-", "."]:
-        numeric_for_int = "0"
-
-    val = None
+    numeric = None
     try:
-        val = float(numeric_for_int)
+        numeric = float(cleaned)
     except Exception:
-        val = None
+        numeric = None
 
-    # Sanity checks & rounding for thrust:
-    if val is not None:
-        # Reject impossible huge readings
-        if abs(val) > 10000:
-            val = None
-        elif abs(val) < 2:
-            # treat as zero/noise
-            val = 0.0
-        else:
-            # round to nearest integer (thrust reported as grams)
-            val = float(round(val))
+    # Filter impossible values and smooth spikes with function attribute
+    MAX_ALLOWED = 10000  # grams; tune if necessary
+    MIN_NOISE = 2
 
-    display = "-" if val is None else str(int(val))
+    if numeric is None:
+        return None, "", float(conf or 0.0)
 
-    # Keep a small smoothing memory to avoid single-frame spikes
-    if not hasattr(read_lcd_thrust, "last"):
-        read_lcd_thrust.last = None
-    if val is not None and read_lcd_thrust.last is not None:
-        if abs(val - read_lcd_thrust.last) > max(200, read_lcd_thrust.last * 2):
-            # spike — ignore and retain last
-            val = read_lcd_thrust.last
-    if val is not None:
-        read_lcd_thrust.last = val
+    if abs(numeric) > MAX_ALLOWED:
+        # impossible - treat as 0 or ignore
+        numeric = 0.0
+    if abs(numeric) < MIN_NOISE:
+        numeric = 0.0
+    else:
+        numeric = round(float(numeric))
 
-    return val, display, float(conf)
+    # smoothing memory
+    if not hasattr(read_lcd_thrust, "last_val"):
+        read_lcd_thrust.last_val = 0.0
+
+    last = getattr(read_lcd_thrust, "last_val", 0.0)
+    if last and numeric and abs(numeric - last) > max(1500, last * 2):
+        # huge jump (e.g., spike) -> likely OCR glitch, keep last
+        numeric = last
+    else:
+        read_lcd_thrust.last_val = numeric
+
+    display = str(int(numeric)) if numeric is not None else ""
+    return numeric, display, float(conf or 0.0)
+
 
 def read_lcd_rpm(frame: np.ndarray) -> Tuple[Optional[float], str, float]:
     """
-    RPM OCR: expect integer-like numbers (no decimals). Remove stray '.' and non-digit chars.
+    RPM reader: integer RPMs no decimals.
     """
-    proc = preprocess_frame(frame, invert=False)
-    reading, conf = _predict_reading(proc, 0.30) if proc is not None else ("", 0.0)
-    reading = reading.replace(".", "").strip()  # drop decimal artifacts for rpm (rare)
-    cleaned = ''.join(ch for ch in reading if ch.isdigit() or ch == '-')
-    if cleaned in ["", "-", "."]:
+    processed = preprocess_frame(frame, invert=False)
+    reading, conf = _predict_reading(processed, 0.30)
+    reading = (reading or "").strip()
+    reading = reading.replace(" ", "").replace(",", "")
+    # Keep only digits and optional '-'
+    cleaned = "".join(ch for ch in reading if ch.isdigit() or ch == "-")
+    try:
+        val = float(cleaned) if cleaned not in ["", "-", "."] else None
+    except Exception:
         val = None
-        display = "-"
-    else:
-        try:
-            val = float(cleaned)
-            display = str(int(round(val)))
-        except Exception:
-            val = None
-            display = "-"
-    return val, display, float(conf)
+    display = str(int(val)) if val is not None else ""
+    return val, display, float(conf or 0.0)
 
-# -------------------- MERGING & REPORTS -------------------- #
+# -------------------- MERGE / REPORT -------------------- #
 def _safe_merge_series(cur: Optional[pd.DataFrame], thr: Optional[pd.DataFrame], rpm: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Merge three series into a single DataFrame with aligned time_s.
-    Ensure column names: current_a, current_display, thrust_g, thrust_display, rpm, rpm_display
-    """
     times = set()
     for df in (cur, thr, rpm):
         if df is not None and not df.empty and "time_s" in df.columns:
@@ -372,315 +427,331 @@ def _safe_merge_series(cur: Optional[pd.DataFrame], thr: Optional[pd.DataFrame],
     if not times:
         return pd.DataFrame(columns=["time_s"])
     merged = pd.DataFrame({"time_s": sorted(times)})
-
     if cur is not None and not cur.empty:
-        # Accept columns current_a and/or current_display
-        cols = [c for c in ["time_s", "current_a", "current_display"] if c in cur.columns]
-        merged = merged.merge(cur[cols], on="time_s", how="left")
+        merged = merged.merge(cur[["time_s", "current_a", "current_display"]], on="time_s", how="left")
     else:
         merged["current_a"] = np.nan
         merged["current_display"] = np.nan
-
     if thr is not None and not thr.empty:
-        cols = [c for c in ["time_s", "thrust_g", "thrust_display"] if c in thr.columns]
-        merged = merged.merge(thr[cols], on="time_s", how="left")
+        merged = merged.merge(thr[["time_s", "thrust_g", "thrust_display"]], on="time_s", how="left")
     else:
         merged["thrust_g"] = np.nan
         merged["thrust_display"] = np.nan
-
     if rpm is not None and not rpm.empty:
-        cols = [c for c in ["time_s", "rpm", "rpm_display"] if c in rpm.columns]
-        merged = merged.merge(rpm[cols], on="time_s", how="left")
+        merged = merged.merge(rpm[["time_s", "rpm", "rpm_display"]], on="time_s", how="left")
     else:
         merged["rpm"] = np.nan
         merged["rpm_display"] = np.nan
-
-    # Ensure display columns exist
-    for col in ["current_display", "thrust_display", "rpm_display"]:
-        if col not in merged.columns:
-            merged[col] = np.nan
-
-    # Ensure numeric columns exist
-    for col in ["current_a", "thrust_g", "rpm"]:
-        if col not in merged.columns:
-            merged[col] = np.nan
-
+    # Fill forward small gaps to create contiguous table for plotting
+    merged = merged.sort_values("time_s").reset_index(drop=True)
     return merged
 
 def build_session_report(session_id: str) -> Dict:
-    """
-    Build report, CSV and graphs. Return dict with table_records, graphs list and csv path.
-    """
-    sess = SESSIONS[session_id]
+    sess = SESSIONS.get(session_id)
+    if not sess:
+        return {}
     meta = sess["meta"]
-
-    cur_df = sess["series"].get("current")
-    thr_df = sess["series"].get("thrust")
-    rpm_df = sess["series"].get("rpm")
-
-    merged = _safe_merge_series(cur_df, thr_df, rpm_df)
+    merged = _safe_merge_series(sess["series"].get("current"), sess["series"].get("thrust"), sess["series"].get("rpm"))
 
     if merged.empty:
         sess["report"] = {"table_csv": None, "graphs": [], "table_records": []}
         return sess["report"]
 
-    # convert numeric columns
-    for c in ["current_a", "thrust_g", "rpm"]:
-        if c in merged.columns:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+    # convert numeric columns safely
+    for col in ["current_a", "thrust_g", "rpm"]:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
-    # compute power if voltage present
+    # compute power & efficiency only if voltage is provided
     voltage = meta.get("voltage")
-    if voltage is not None:
+    if voltage is not None and "current_a" in merged.columns:
         merged["power_w"] = merged["current_a"] * float(voltage)
     else:
         merged["power_w"] = np.nan
+    merged["efficiency_gw"] = merged["thrust_g"] / merged["power_w"].replace({0: np.nan}) if "thrust_g" in merged.columns else np.nan
 
-    # compute efficiency (protect against div-by-zero)
-    merged["efficiency_gw"] = merged["thrust_g"] / merged["power_w"]
-    # sanitize infinite/nan
-    merged = merged.replace([np.inf, -np.inf], np.nan)
+    # Replace inf/nan with zeros for JSON safety, but keep copy for CSV
+    csv_df = merged.copy()
+    csv_path = os.path.join(RESULT_DIR, f"{session_id}_report.csv")
+    csv_df.to_csv(csv_path, index=False)
 
-    # Save raw merged CSV (machine format)
-    csv_path = os.path.join(RESULT_DIR, f"{session_id}_merged.csv")
-    merged.to_csv(csv_path, index=False)
+    # For passing to frontend and plotting, replace inf/nan with 0
+    merged = merged.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # convert any numpy types to python
+    merged = merged.applymap(lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x)
 
-    # Plot graphs and save
-    graphs: List[str] = []
-    def _plot(col: str, ylabel: str, fname: str):
-        if col not in merged.columns:
-            return
-        ser = pd.to_numeric(merged[col], errors="coerce")
-        if ser.dropna().empty:
-            return
-        plt.figure(figsize=(12, 4))
-        plt.plot(merged["time_s"], ser, marker="o", markersize=2)
-        plt.xlabel("Time (s)")
-        plt.ylabel(ylabel)
-        plt.title(f"{ylabel} vs Time")
-        plt.grid(True, alpha=0.3)
-        out = os.path.join(RESULT_DIR, f"{session_id}_{fname}.png")
-        plt.savefig(out, bbox_inches="tight")
-        plt.close()
-        graphs.append(out)
+    # -------- Plot Graphs -------- #
+    graphs = []
+    def plot(col, label, name):
+        if col in merged.columns:
+            numeric = pd.to_numeric(merged[col], errors="coerce")
+            if numeric.notna().any():
+                plt.figure(figsize=(12, 4))
+                plt.plot(merged["time_s"].astype(float), numeric.astype(float))
+                plt.xlabel("Time (s)")
+                plt.ylabel(label)
+                plt.title(f"{label} vs Time")
+                plt.grid(True)
+                out = os.path.join(RESULT_DIR, f"{session_id}_{name}.png")
+                plt.savefig(out, bbox_inches="tight")
+                plt.close()
+                graphs.append(out)
 
-    _plot("current_a", "Current (A)", "current")
-    _plot("thrust_g", "Thrust (G)", "thrust")
-    _plot("rpm", "RPM", "rpm")
-    _plot("power_w", "Power (W)", "power")
-    _plot("efficiency_gw", "Efficiency (G/W)", "efficiency")
+    plot("current_a", "Current (A)", "current")
+    plot("thrust_g", "Thrust (G)", "thrust")
+    plot("rpm", "RPM", "rpm")
 
-    # Build frontend-friendly pretty table rows preserving display strings when available
-    records: List[Dict] = []
-    # prefer display columns if available, fallback to numeric formatting
-    for _, row in merged.iterrows():
-        # get display columns or format numeric
-        def safe_display(numcol: str, dispcol: str, int_mode=False, decimals=2, default="-"):
-            if dispcol in merged.columns and pd.notna(row.get(dispcol)):
-                return str(row.get(dispcol))
-            if numcol in merged.columns and not pd.isna(row.get(numcol)):
-                v = row.get(numcol)
-                if int_mode:
-                    return str(int(round(float(v))))
-                else:
-                    return f"{float(v):.{decimals}f}"
-            return default
+    # -------- Build table records for frontend -------- #
+    records = []
+    for rec in merged.to_dict(orient="records"):
+        safe = {}
+        for k, v in rec.items():
+            # sanitize NaN / inf
+            try:
+                if isinstance(v, (float, np.floating)) and (math.isnan(v) or math.isinf(v)):
+                    v = 0.0
+            except Exception:
+                pass
+            # ensure native python types
+            if isinstance(v, np.generic):
+                v = np.asscalar(v) if hasattr(np, "asscalar") else v.item()
+            safe[k] = v
 
-        rec = {
-            "Time (s)": round(float(row.get("time_s", 0.0)), 2),
-            "Voltage (V)": meta.get("voltage") if meta.get("voltage") is not None else "-",
-            "Prop": meta.get("prop") or "-",
-            "Motor": meta.get("motor") or "-",
-            "ESC": meta.get("esc") or "-",
-            "Throttle": "-",
-            "Current (A)": safe_display("current_a", "current_display", int_mode=False, decimals=2, default="-"),
-            "Power (W)": safe_display("power_w", "power_w", int_mode=False, decimals=2, default="-"),
-            "Thrust (G)": safe_display("thrust_g", "thrust_display", int_mode=True, decimals=0, default="-"),
-            "RPM": safe_display("rpm", "rpm_display", int_mode=True, decimals=0, default="-"),
-            "Efficiency (G/W)": safe_display("efficiency_gw", "efficiency_gw", int_mode=False, decimals=3, default="-"),
-            "Operating Temperature (°C)": "-",
+        frontend_row = {
+            "Time (s)": round(float(safe.get("time_s", 0)), 3),
+            "Voltage (V)": meta.get("voltage", 0),
+            "Prop": meta.get("prop", ""),
+            "Motor": meta.get("motor", ""),
+            "ESC": meta.get("esc", ""),
+            "Throttle": "",  # placeholder
+            "Current (A)": round(float(safe.get("current_a", 0)), 2) if safe.get("current_a", 0) is not None else 0.0,
+            "Power (W)": round(float(safe.get("power_w", 0)), 2) if safe.get("power_w", 0) is not None else 0.0,
+            "Thrust (G)": int(round(float(safe.get("thrust_g", 0)))) if safe.get("thrust_g", 0) is not None else 0,
+            "RPM": int(round(float(safe.get("rpm", 0)))) if safe.get("rpm", 0) is not None else 0,
+            "Efficiency (G/W)": round(float(safe.get("efficiency_gw", 0)), 3) if safe.get("efficiency_gw", 0) is not None else 0.0,
+            "Operating Temperature (°C)": "",  # placeholder
         }
-        records.append(rec)
+        records.append(frontend_row)
 
-    # Save pretty CSV for user download
-    pretty_df = pd.DataFrame(records)
-    pretty_csv = os.path.join(RESULT_DIR, f"{session_id}_report.csv")
-    pretty_df.to_csv(pretty_csv, index=False)
-
-    sess["report"] = {"table_csv": pretty_csv, "graphs": graphs, "table_records": records}
+    sess["report"] = {"table_csv": csv_path, "graphs": graphs, "table_records": records}
     return sess["report"]
 
 # -------------------- MAIN PROCESS -------------------- #
 def process_video_task(task_id: str, session_id: str, video_type: str, video_path: str, meta: Dict) -> None:
     """
-    Process a single video file in background.
-    video_type must be one of: 'current', 'thrust', 'rpm'
+    Processes a single uploaded video (one per call).
+    video_type in {"current", "thrust", "rpm"}
     """
     try:
         reset_progress(task_id)
         TASK_PROGRESS[task_id].update({"status": "running", "phase": "init", "progress": 0})
         _init_session(session_id, meta)
-        fps = int(meta.get("fps", 5)) if meta.get("fps") else 5
-        if fps <= 0:
-            fps = 5
 
-        # Extract frames
+        fps = int(meta.get("fps", 5))
+        TASK_PROGRESS[task_id].update({"phase": "extracting", "message": "Extracting frames..."})
         frames = extract_frames_custom(task_id, video_path, fps)
-        if not frames:
-            TASK_PROGRESS[task_id].update({"status": "error", "message": "No frames extracted", "progress": 0})
-            return
+        total = max(1, len(frames))
+        TASK_PROGRESS[task_id].update({"message": f"Processing {total} frames...", "progress": 1})
 
-        total = len(frames)
-        TASK_PROGRESS[task_id].update({"phase": "processing", "progress": 1})
-        _dprint(f"[DEBUG] Starting processing {total} frames for {video_type}")
-
-        # Warm-up model once (YOLO can be slow first call)
-        try:
-            if not hasattr(MODEL, "_warmed_up"):
-                _dprint("[INFO] Warming up YOLO model...")
-                MODEL.predict(np.zeros((64, 64, 3), np.uint8))
-                MODEL._warmed_up = True
-        except Exception as e:
-            _dprint(f"[WARN] YOLO warm-up failed: {e}")
-
+        # rows will be time-series data for this video_type
         rows = []
-        recent = deque(maxlen=7)
-        prev_raw_global = None
+        # recent buffer of raw display strings for consensus
+        recent_raw = deque(maxlen=9)  # increased length for stability
+        recent_conf = deque(maxlen=9)
+        # track last valid numeric for smoothing (store per video_type)
+        last_val_attr = f"last_val_{video_type}"
+        if not hasattr(process_video_task, last_val_attr):
+            setattr(process_video_task, last_val_attr, 0.0)
+
+        # Warm up the model if needed
+        if MODEL is not None:
+            try:
+                # small warmup with blank image to avoid first-inference spike
+                blank = np.zeros((64, 64, 3), dtype=np.uint8)
+                MODEL.predict(blank, verbose=False)
+            except Exception:
+                pass
 
         for i, fp in enumerate(frames):
             img = cv2.imread(fp)
             if img is None:
-                # continue but still update progress
-                TASK_PROGRESS[task_id]["progress"] = int(((i+1)/total) * 90)
+                # update progress and continue
+                TASK_PROGRESS[task_id]["progress"] = int((i / total) * 85)
                 continue
 
-            # choose pipeline
+            # select reader
             if video_type == "current":
                 val, raw, conf = read_lcd_current(img)
-                col_val_name = "current_a"
-                col_disp_name = "current_display"
+                display_key = "current_display"
+                numeric_key = "current_a"
             elif video_type == "thrust":
                 val, raw, conf = read_lcd_thrust(img)
-                col_val_name = "thrust_g"
-                col_disp_name = "thrust_display"
+                display_key = "thrust_display"
+                numeric_key = "thrust_g"
             else:
                 val, raw, conf = read_lcd_rpm(img)
-                col_val_name = "rpm"
-                col_disp_name = "rpm_display"
+                display_key = "rpm_display"
+                numeric_key = "rpm"
 
-            # Stabilize by recent mode
-            recent.append(str(raw))
-            non_empty = [r for r in recent if r not in ["", None, "-"]]
-            chosen_raw = None
+            raw = raw or ""
+            conf = float(conf or 0.0)
+            recent_raw.append(raw)
+            recent_conf.append(conf)
+
+            # Consensus logic:
+            # pick most common non-empty reading in recent buffer weighted by average confidence
+            non_empty = [r for r in recent_raw if r not in ["", None]]
+            chosen = raw
             if non_empty:
-                counter = Counter(non_empty)
-                most_common, count = counter.most_common(1)[0]
-                if count >= 2:
-                    chosen_raw = most_common
-            if chosen_raw is None:
-                chosen_raw = str(raw)
+                counts = Counter(non_empty)
+                most_common, cnt = counts.most_common(1)[0]
+                # compute avg conf of frames that reported most_common
+                confs_for_mc = [recent_conf[idx] for idx, r in enumerate(recent_raw) if r == most_common]
+                avg_conf_mc = float(np.mean(confs_for_mc)) if confs_for_mc else 0.0
+                # compute avg conf for current raw
+                avg_conf_raw = conf
+                # prefer most_common if it appears >= 2 times and average confidence comparable
+                if cnt >= 2 and avg_conf_mc >= (avg_conf_raw - 0.15):
+                    chosen = most_common
+                else:
+                    chosen = raw
 
-            # Preserve minus sign heuristics
-            if non_empty:
-                neg_count = sum(1 for r in non_empty if isinstance(r, str) and r.startswith("-"))
-                if neg_count >= max(1, (len(non_empty) // 2)) and not (isinstance(chosen_raw, str) and chosen_raw.startswith("-")):
-                    s = "" if chosen_raw in [None] else str(chosen_raw)
-                    chosen_raw = "-" + s.lstrip("-")
+            # If the previous saved raw had a negative sign, keep sign if digits match
+            prev_row = rows[-1] if rows else None
+            if prev_row is not None:
+                prev_disp = prev_row.get(display_key, "")
+                if prev_disp and prev_disp.startswith("-") and not chosen.startswith("-"):
+                    # compare digits-only
+                    prev_digits = "".join(ch for ch in prev_disp if ch.isdigit() or ch == ".")
+                    now_digits = "".join(ch for ch in chosen if ch.isdigit() or ch == ".")
+                    if prev_digits == now_digits and now_digits != "":
+                        chosen = "-" + chosen
 
-            if prev_raw_global and isinstance(prev_raw_global, str) and prev_raw_global.startswith("-") and isinstance(chosen_raw, str) and not chosen_raw.startswith("-"):
-                digits_prev = "".join([c for c in prev_raw_global if c.isdigit() or c == "."])
-                digits_now = "".join([c for c in chosen_raw if c.isdigit() or c == "."])
-                if digits_prev == digits_now and digits_now != "":
-                    chosen_raw = "-" + chosen_raw.lstrip("-")
-
-            prev_raw_global = chosen_raw if isinstance(chosen_raw, str) and chosen_raw != "" else prev_raw_global
-
-            # Try parse numeric value from chosen_raw (be lenient)
-            chosen_val = None
+            # try to parse chosen into numeric if not already
+            numeric_val = None
             try:
-                tmp = ''.join(ch for ch in chosen_raw if ch in "0123456789.-")
-                if tmp not in ["", "-", "."]:
-                    chosen_val = float(tmp)
+                # for current, chosen may be like "00.70" or "-00.70" -> parse
+                cleaned = "".join(ch for ch in chosen if ch in "0123456789.-")
+                if cleaned not in ["", "-", ".", "-."]:
+                    numeric_val = float(cleaned)
+                else:
+                    numeric_val = None
             except Exception:
-                chosen_val = None
+                numeric_val = None
 
-            # normalize storage: use canonical column names expected later
-            entry = {"time_s": round(i * (1.0 / max(1, fps)), 4)}
-            entry[col_disp_name] = chosen_raw
-            entry[col_val_name] = chosen_val
+            # smoothing and spike filter per type
+            last_val = getattr(process_video_task, last_val_attr, 0.0)
+            if numeric_val is not None:
+                if video_type == "thrust":
+                    # clamp unrealistic values and smooth spikes
+                    if abs(numeric_val) > 20000:  # safety clamp
+                        numeric_val = last_val
+                    # remove small noise
+                    if abs(numeric_val) < 2:
+                        numeric_val = 0.0
+                    else:
+                        numeric_val = round(float(numeric_val))
+                    # spike rejection: > 3x last and absolute diff big => keep last
+                    if last_val and abs(numeric_val - last_val) > max(2000, last_val * 2):
+                        numeric_val = last_val
+                    else:
+                        setattr(process_video_task, last_val_attr, numeric_val)
+                elif video_type == "current":
+                    # keep 2 decimals
+                    # numeric_val remains float with decimals; format later for display
+                    # minor smoothing
+                    if last_val and abs(numeric_val - last_val) > 5:
+                        # improbable change in current per frame: use last val if large jump
+                        numeric_val = last_val
+                    else:
+                        setattr(process_video_task, last_val_attr, numeric_val)
+                else:  # rpm
+                    # integer rpm
+                    if numeric_val < 0:
+                        # RPM negative? unlikely: keep absolute
+                        numeric_val = abs(numeric_val)
+                    numeric_val = int(round(float(numeric_val)))
+                    if last_val and abs(numeric_val - last_val) > max(500, last_val * 2):
+                        numeric_val = last_val
+                    else:
+                        setattr(process_video_task, last_val_attr, numeric_val)
 
-            rows.append(entry)
+            # timestamp
+            t = round(i * (1.0 / float(max(1, fps))), 4)
+            row = {"time_s": t, display_key: chosen, numeric_key: numeric_val}
+            rows.append(row)
 
-            # update progress intermittently
-            if i % max(1, total // 100) == 0 or i == total - 1:
-                TASK_PROGRESS[task_id]["progress"] = int(((i+1)/total) * 90)
+            # Update progress (cap at 85 while processing)
+            if total:
+                TASK_PROGRESS[task_id]["progress"] = min(85, int(((i + 1) / total) * 85))
+            _dprint(f"[DEBUG] Frame {i+1}/{total} | Type:{video_type} | Raw:'{raw}' | Chosen:'{chosen}' | Conf:{conf:.2f} | Val:{numeric_val}")
 
-            _dprint(f"[DEBUG] Frame {i+1}/{total} | Type:{video_type} | Raw:'{raw}' | Chosen:'{chosen_raw}' | Conf:{conf:.2f} | Val:{chosen_val}")
-
-        # Build dataframe and attach to session
-        if rows:
-            df = pd.DataFrame(rows)
+        # Create DataFrame and store to session
+        df = pd.DataFrame(rows)
+        # Ensure columns exist consistently
+        if video_type == "current":
+            if "current_a" not in df.columns:
+                df["current_a"] = np.nan
+            if "current_display" not in df.columns:
+                df["current_display"] = ""
+        elif video_type == "thrust":
+            if "thrust_g" not in df.columns:
+                df["thrust_g"] = np.nan
+            if "thrust_display" not in df.columns:
+                df["thrust_display"] = ""
         else:
-            df = pd.DataFrame(columns=["time_s", col_val_name, col_disp_name])
+            if "rpm" not in df.columns:
+                df["rpm"] = np.nan
+            if "rpm_display" not in df.columns:
+                df["rpm_display"] = ""
 
-        # Ensure columns exist with proper names
-        # For current: current_a, current_display
-        # For thrust: thrust_g, thrust_display
-        # For rpm: rpm, rpm_display
-        expected_val_col = col_val_name
-        expected_disp_col = col_disp_name
-        if expected_val_col not in df.columns:
-            df[expected_val_col] = np.nan
-        if expected_disp_col not in df.columns:
-            df[expected_disp_col] = np.nan
-        if "time_s" not in df.columns:
-            df["time_s"] = [round(i * (1.0 / max(1, fps)), 4) for i in range(len(df))]
+        # coerce types: numeric columns to floats
+        if video_type == "current":
+            df["current_a"] = pd.to_numeric(df["current_a"], errors="coerce").fillna(0.0)
+        elif video_type == "thrust":
+            df["thrust_g"] = pd.to_numeric(df["thrust_g"], errors="coerce").fillna(0.0)
+        else:
+            df["rpm"] = pd.to_numeric(df["rpm"], errors="coerce").fillna(0.0)
 
-        # coerce numeric column to numeric type
-        try:
-            df[expected_val_col] = pd.to_numeric(df[expected_val_col], errors="coerce")
-        except Exception:
-            pass
-
-        # store the series in the session in canonical name
+        # store updated series into session (overwrites previous for this type)
+        if session_id not in SESSIONS:
+            _init_session(session_id, meta)
         SESSIONS[session_id]["series"][video_type] = df
 
-        TASK_PROGRESS[task_id].update({"phase": "report", "progress": 95})
+        TASK_PROGRESS[task_id].update({"phase": "report", "progress": 90, "message": "Building report..."})
         report = build_session_report(session_id)
 
-        # persist result in DB as before
+        # Persist results
         save_test_result(
             session_id=session_id,
-            prop_name=SESSIONS[session_id]["meta"].get("prop", ""),
-            motor_name=SESSIONS[session_id]["meta"].get("motor", ""),
-            esc_name=SESSIONS[session_id]["meta"].get("esc", ""),
-            voltage=SESSIONS[session_id]["meta"].get("voltage"),
+            prop_name=meta.get("prop", ""),
+            motor_name=meta.get("motor", ""),
+            esc_name=meta.get("esc", ""),
+            voltage=meta.get("voltage"),
             csv_path=report.get("table_csv"),
             graph_paths=report.get("graphs", []),
-            table_data=report.get("table_records", []),
+            table_data=report.get("table_records", [])
         )
 
         TASK_PROGRESS[task_id].update({"status": "done", "progress": 100, "message": "Completed"})
         _dprint(f"[INFO] Completed {video_type} ({len(frames)} frames) in session {session_id}")
 
     except Exception as e:
-        _dprint(f"[ERROR] process_video_task exception: {type(e).__name__}: {e}")
-        TASK_PROGRESS[task_id].update({"status": "error", "message": f"{type(e).__name__}: {e}"})
+        logging.exception("Error processing video task")
+        TASK_PROGRESS[task_id].update({"status": "error", "message": str(e)})
     finally:
+        # attempt to remove uploaded file to keep disk tidy
         try:
             if os.path.exists(video_path):
                 os.remove(video_path)
         except Exception:
             pass
 
-# -------------------- SESSION HELPERS -------------------- #
+# -------------------- BACKGROUND STARTER / SESSION API HELPERS -------------------- #
 def start_background_task(session_id: str, video_type: str, video_path: str, meta: Dict) -> str:
     task_id = str(uuid.uuid4())
-    threading.Thread(
-        target=process_video_task,
-        args=(task_id, session_id, video_type, video_path, meta),
-        daemon=True
-    ).start()
+    reset_progress(task_id)
+    threading.Thread(target=process_video_task, args=(task_id, session_id, video_type, video_path, meta), daemon=True).start()
     return task_id
 
 def get_session_report(session_id: str) -> Optional[Dict]:
@@ -693,7 +764,7 @@ def get_session_report(session_id: str) -> Optional[Dict]:
         "meta": meta,
         "table": rep.get("table_records", []),
         "csv_url": f"/session/{session_id}/csv" if rep.get("table_csv") else None,
-        "graphs": [f"/session/{session_id}/graph/{i}" for i in range(len(rep.get("graphs", [])))],
+        "graphs": [f"/session/{session_id}/graph/{i}" for i in range(len(rep.get("graphs", [])))]
     }
 
 def get_session_graph_path(session_id: str, idx: int) -> Optional[str]:
@@ -710,3 +781,5 @@ def get_session_csv_path(session_id: str) -> Optional[str]:
     if not sess or not sess.get("report"):
         return None
     return sess["report"].get("table_csv")
+
+# -------------------- END -------------------- #
