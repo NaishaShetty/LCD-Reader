@@ -7,3 +7,6 @@ matplotlib
 ffmpeg-python
 ultralytics
 PyYAML
+fpdf2
+kaleido
+
