@@ -139,78 +139,46 @@ def _predict_reading(img: np.ndarray, conf: float) -> Tuple[str, float]:
     return "".join([c for _,c,_ in boxes]), np.mean([s for _,_,s in boxes]) if boxes else 0.0
 
 # -------------------- READERS --------------------
+import os
+import cv2
+import numpy as np
+import logging
+from collections import deque
+from typing import Optional, Tuple
+
+# Assumes you already have a working _predict_reading(img, conf) function
+# that returns (text, confidence). It must accept a 3-channel BGR (H,W,3) numpy array.
+
 def read_lcd_current(frame: np.ndarray):
     """
-    Reads and formats current as:
-      - numeric_val: float (e.g., 0.69)
-      - display_val: string in -xx.xx format (e.g., -00.69)
-    Always shows '-' and leading zeros unless current ≈ 0 (then 00.00).
-    Includes OCR error correction and temporal smoothing.
+    Simplified, robust current LCD reader for cropped video.
     """
-    if not hasattr(read_lcd_current, "history"):
-        read_lcd_current.history = deque(maxlen=6)
+    # Preprocess with controlled contrast and inversion
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.convertScaleAbs(gray, alpha=1.6, beta=-20)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    processed = preprocess_frame(frame)
-    txt, conf = _predict_reading(processed, 0.25)
-    txt = (txt or "").replace("..", ".").replace("_", "-").replace(",", ".").strip()
-    if txt.endswith("."):
-        txt = txt[:-1]
+    # Try both normal and inverted
+    variants = [gray, 255 - gray]
 
-    cleaned = "".join(ch for ch in txt if ch in "0123456789.-")
-    val = None
+    best_txt, best_conf = "", 0.0
+    for g in variants:
+        txt, conf = _predict_reading(cv2.cvtColor(g, cv2.COLOR_GRAY2BGR), 0.25)
+        if conf > best_conf:
+            best_txt, best_conf = txt.strip(), conf
 
-    def interpret_numeric(s: str) -> Optional[float]:
-        if not s:
-            return None
-        neg = s.startswith("-")
-        s2 = s.lstrip("-")
-        if "." in s2:
-            try:
-                val = float(s2)
-                return -val if neg else val
-            except:
-                return None
-        if s2.isdigit():
-            n = len(s2)
-            iv = int(s2)
-            if n <= 2:
-                val = iv / 100.0
-            elif n == 3:
-                val = iv / 1000.0
-            else:
-                val = iv / (10 ** (n - 2))
-            return -val if neg else val
-        return None
-
+    # Normalize and interpret as before
+    cleaned = "".join(c for c in best_txt.replace("..", ".") if c in "0123456789.-")
     try:
-        val = interpret_numeric(cleaned)
-    except Exception:
+        val = float(cleaned) if cleaned not in ["", ".", "-"] else None
+    except:
         val = None
 
-    hist = read_lcd_current.history
-    if val is None and hist:
-        val = float(np.median(list(hist)))
-    elif val is not None:
-        if hist:
-            median = float(np.median(list(hist)))
-            if abs(val - median) > 0.5 and (
-                abs(median) > 0.001 and abs((val - median) / (median if median != 0 else 1)) > 2.0
-            ):
-                val = median
-        hist.append(val)
-
     if val is None:
-        numeric_val = None
-        display_val = "-00.00"
-    else:
-        numeric_val = float(round(val, 3))
-        if abs(numeric_val) < 0.005:
-            display_val = "00.00"
-        else:
-            abs_val = abs(numeric_val)
-            display_val = f"-{abs_val:05.2f}"  # ✅ always shows -xx.xx
+        return None, "-00.00", best_conf
 
-    return numeric_val, display_val, float(conf or 0.0)
+    display = "00.00" if abs(val) < 0.005 else f"-{abs(val):05.2f}"
+    return val, display, best_conf
 
 
 def read_lcd_thrust(frame: np.ndarray):
